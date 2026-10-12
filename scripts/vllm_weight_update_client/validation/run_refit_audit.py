@@ -195,7 +195,9 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
-        "--weight-transfer-config", default='{"backend":"nccl","packed":true}'
+        "--weight-transfer-config",
+        default='{"backend":"nccl"}',
+        help='server config; add "packed": true on vLLM builds that have it',
     )
     parser.add_argument("--memory-growth-limit-mb", type=float, default=64)
     parser.add_argument("--startup-timeout", type=float, default=1800)
