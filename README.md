@@ -30,12 +30,13 @@ Full usage notes are in
 
 ### Server contract
 
-The server must use the NCCL backend with `packed` enabled; packed buffer size
-and count use vLLM defaults, and the inference worker world size does not change
-during an update:
+The server must use the NCCL backend, and the inference worker world size does
+not change during an update. On current vLLM the trainer side chooses packed
+transfer and sends it to the workers at init; older builds that have a server
+`packed` field need `"packed": true` there:
 
 ```bash
---weight-transfer-config '{"backend":"nccl","packed":true}'
+--weight-transfer-config '{"backend":"nccl"}'
 ```
 
 Client and server containers must share the same vLLM runtime.
@@ -105,6 +106,41 @@ the digest temporaries (about 0.5 GiB). The driver starts the servers itself
 (`VLLM_SERVER_DEV_MODE=1`, `--worker-extension-cls
 tensor_audit_extension.TensorAuditExtension`); for other topologies, run
 `tensor_audit.py snapshot` / `compare` against servers you start.
+
+### Engine benchmarks with a sharded trainer — `bench/`
+
+The publisher above is one unsharded rank. To measure what a weight sync costs
+a real trainer, `bench/` holds the checkpoint the way a sharded trainer would and
+pushes it through a vLLM weight-transfer engine's own trainer API. There is no
+model code: each rank reads only its slice of the safetensors checkpoint into
+DTensors on a `(pp, dp, fsdp, tp)` mesh.
+
+| File (`bench/`) | Purpose |
+|---|---|
+| `layout.py` | Trainer layout (`pp=2,fsdp=2,tp=2`, ...), tp placement name rules (overridable with a JSON file), pipeline stage split |
+| `engines.py` | What each engine supports (`ENGINE_CAPS`), and why a layout or launcher is refused |
+| `sharded_checkpoint.py` | Per-rank checkpoint slices as DTensors; `WeightSource` that gathers them |
+| `trainer_main.py` | One trainer rank: syncs alternate between checkpoints; wall time, RPC times, pause window, peak memory per rank |
+| `ray_launcher.py` | Runs the same ranks as Ray actors in a placement group (multi-node via `--ray-address`) |
+| `run_bench.py` | Driver: server (or `--base-url`), trainer, `result.json`, `report.md`, a row in `results.jsonl`; `--audit` adds the refit-equals-fresh audit |
+
+`--launcher torchrun|ray` is independent of the engine, except that engines whose
+trainer ranks must be Ray actors (`sharded_rdt`) only run under Ray. The harness
+does not work around what an engine cannot do: `nccl` has a single sender, so a
+`pp=2` trainer is refused with the missing capability named, rather than timed
+through a gather the harness adds. `--layout trainerless` runs the publisher
+above as the baseline (it reads the checkpoint from disk inside the timed sync).
+
+```bash
+B=scripts/vllm_weight_update_client/bench
+python $B/run_bench.py --model-a <A-dir> --update <B-dir> --update <C-dir> \
+  --backend nccl --layout fsdp=2 --launcher torchrun \
+  --server-gpus 0,1 --trainer-gpus 2,3 --audit --output-dir <result-dir> \
+  -- --tensor-parallel-size 2 --max-model-len 2048 --gpu-memory-utilization 0.5
+```
+
+Engines: `nccl` is driven today; `nccl_m2n`, `ipc` and `sharded_rdt` are listed
+in `ENGINE_CAPS` and refused until the harness drives them.
 
 ## 2. Source snapshot — `scripts/rl_source_snapshot.py`
 

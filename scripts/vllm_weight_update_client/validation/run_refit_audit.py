@@ -26,123 +26,35 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import signal
 import subprocess
 import sys
-import time
-import urllib.error
-import urllib.request
 from pathlib import Path
-from typing import Any
 
 HERE = Path(__file__).resolve().parent
 CLIENT = HERE.parent
 sys.path.insert(0, str(HERE))
 
 import tensor_audit  # noqa: E402
-
-EXTENSION = "tensor_audit_extension.TensorAuditExtension"
-WARMUP_PROMPTS = (
-    "State the capital of France in one word.",
-    " ".join(["The quick brown fox jumps over the lazy dog."] * 40),
-)
+from server import Server, get_json  # noqa: E402
 
 
-def _get(url: str, timeout: float = 10) -> Any:
-    with urllib.request.urlopen(url, timeout=timeout) as response:
-        body = response.read()
-    return json.loads(body) if body else None
-
-
-def _post(url: str, payload: dict, timeout: float = 600) -> Any:
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"},
-        method="POST",
+def start_server(args: argparse.Namespace, model: str, log: Path) -> Server:
+    return Server(
+        model,
+        log=log,
+        port=args.port,
+        gpus=args.server_gpus,
+        python=args.python,
+        weight_transfer_config=args.weight_transfer_config,
+        serve_args=args.serve_args,
+        startup_timeout=args.startup_timeout,
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.load(response)
 
 
-class Server:
-    """A vLLM OpenAI server with the audit extension, in its own process group."""
-
-    def __init__(self, args: argparse.Namespace, model: str, log: Path) -> None:
-        self.url = f"http://127.0.0.1:{args.port}"
-        env = dict(os.environ)
-        env["VLLM_SERVER_DEV_MODE"] = "1"
-        env["CUDA_VISIBLE_DEVICES"] = args.server_gpus
-        env["PYTHONPATH"] = os.pathsep.join(
-            p for p in (str(HERE), env.get("PYTHONPATH", "")) if p
-        )
-        cmd = [
-            args.python,
-            "-m",
-            "vllm.entrypoints.openai.api_server",
-            "--model",
-            model,
-            "--port",
-            str(args.port),
-            "--weight-transfer-config",
-            args.weight_transfer_config,
-            "--worker-extension-cls",
-            EXTENSION,
-            *args.serve_args,
-        ]
-        self.log = log
-        self.handle = log.open("w")
-        self.proc = subprocess.Popen(
-            cmd,
-            env=env,
-            stdout=self.handle,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-        deadline = time.monotonic() + args.startup_timeout
-        while time.monotonic() < deadline:
-            if self.proc.poll() is not None:
-                raise RuntimeError(f"server exited during startup, see {log}")
-            try:
-                _get(f"{self.url}/health")
-                self.model = _get(f"{self.url}/v1/models")["data"][0]["id"]
-                return
-            except (urllib.error.URLError, ConnectionError, OSError):
-                time.sleep(2)
-        self.stop()
-        raise TimeoutError(f"server did not become healthy, see {log}")
-
-    def warm(self) -> None:
-        """Requests between snapshots: build lazy caches and dirty runtime
-        workspaces, so they show up as runtime state, not as weights."""
-        for prompt in WARMUP_PROMPTS:
-            try:
-                _post(
-                    f"{self.url}/v1/completions",
-                    {
-                        "model": self.model,
-                        "prompt": prompt,
-                        "max_tokens": 16,
-                        "temperature": 0,
-                    },
-                )
-            except urllib.error.HTTPError as exc:  # e.g. longer than max_model_len
-                print(f"warm-up request rejected ({exc.code}), continuing")
-
-    def snapshot(self, path: Path) -> tensor_audit.Snapshot:
-        snap = tensor_audit.fetch_snapshot(self.url)
-        path.write_text(json.dumps(snap) + "\n")
-        return snap
-
-    def stop(self) -> None:
-        if self.proc.poll() is None:
-            os.killpg(self.proc.pid, signal.SIGTERM)
-            try:
-                self.proc.wait(timeout=120)
-            except subprocess.TimeoutExpired:
-                os.killpg(self.proc.pid, signal.SIGKILL)
-                self.proc.wait()
-        self.handle.close()
+def snapshot(server: Server, path: Path) -> tensor_audit.Snapshot:
+    snap = tensor_audit.fetch_snapshot(server.url)
+    path.write_text(json.dumps(snap) + "\n")
+    return snap
 
 
 def publish(args: argparse.Namespace, url: str, checkpoint: str, out: Path) -> None:
@@ -215,31 +127,31 @@ def main() -> None:
     names = [f"update{i + 1}" for i in range(len(args.update))]
     snaps: dict[str, tensor_audit.Snapshot] = {}
     runtime_pairs: list[tuple[str, str]] = []
-    server = Server(args, args.model_a, out / "server_a.log")
+    server = start_server(args, args.model_a, out / "server_a.log")
     try:
-        version = _get(f"{server.url}/version").get("version")
+        version = get_json(f"{server.url}/version").get("version")
         server.warm()
-        snaps["a"] = server.snapshot(out / "a.json")
+        snaps["a"] = snapshot(server, out / "a.json")
         server.warm()
-        snaps["a_repeat"] = server.snapshot(out / "a_repeat.json")
+        snaps["a_repeat"] = snapshot(server, out / "a_repeat.json")
         runtime_pairs.append(("a", "a_repeat"))
         for name, checkpoint in zip(names, args.update, strict=False):
             publish(args, server.url, checkpoint, out / f"{name}_publish")
             server.warm()
-            snaps[name] = server.snapshot(out / f"{name}.json")
+            snaps[name] = snapshot(server, out / f"{name}.json")
             server.warm()
-            snaps[f"{name}_repeat"] = server.snapshot(out / f"{name}_repeat.json")
+            snaps[f"{name}_repeat"] = snapshot(server, out / f"{name}_repeat.json")
             runtime_pairs.append((name, f"{name}_repeat"))
     finally:
         server.stop()
     for name, checkpoint in zip(names, args.update, strict=False):
-        fresh = Server(args, checkpoint, out / f"server_{name}_fresh.log")
+        fresh = start_server(args, checkpoint, out / f"server_{name}_fresh.log")
         try:
             fresh.warm()
-            snaps[f"{name}_fresh"] = fresh.snapshot(out / f"{name}_fresh.json")
+            snaps[f"{name}_fresh"] = snapshot(fresh, out / f"{name}_fresh.json")
             fresh.warm()
-            snaps[f"{name}_fresh_repeat"] = fresh.snapshot(
-                out / f"{name}_fresh_repeat.json"
+            snaps[f"{name}_fresh_repeat"] = snapshot(
+                fresh, out / f"{name}_fresh_repeat.json"
             )
             runtime_pairs.append((f"{name}_fresh", f"{name}_fresh_repeat"))
         finally:
