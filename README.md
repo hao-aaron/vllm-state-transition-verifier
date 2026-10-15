@@ -148,6 +148,11 @@ Engines driven today:
 | `ipc` | the server's GPUs (`--trainer-gpus` = `--server-gpus`) | dp, fsdp, tp | server gets `VLLM_ALLOW_INSECURE_SERIALIZATION=1` |
 | `sharded_rdt` | separate from the server | dp, fsdp, tp, pp | `--launcher ray` only; the driver starts a private Ray head (`--ray-temp-dir`) that the server (Ray executor) and trainer share, or joins `--ray-address`; needs `nixl` |
 
+Temp files follow the environment: nvcc, torch inductor and Python use
+`TMPDIR`, Ray uses `RAY_TMPDIR` (or `--ray-temp-dir`), and the server, trainer
+ranks and Ray head all inherit them. On hosts with a small root disk, point
+them at local scratch (e.g. `/mnt/data/$USER`) before running.
+
 With `--audit`, the trainer records server allocator stats after every sync.
 Memory an engine allocates during the first sync and keeps (RDT's receive
 rings) is reported as engine-resident; the leak check runs from there.

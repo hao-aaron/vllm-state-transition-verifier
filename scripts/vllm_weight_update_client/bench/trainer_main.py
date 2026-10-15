@@ -43,13 +43,13 @@ from engines import (  # noqa: E402
     rdt_init_info,
     unsupported_reasons,
 )
-from layout import MESH_DIMS, PlacementRules, TrainerLayout  # noqa: E402
+from layout import PlacementRules, TrainerLayout  # noqa: E402
 from sharded_checkpoint import (  # noqa: E402
     GatherSource,
     ShardedCheckpoint,
     ShardedM2NSource,
+    build_meshes,
 )
-from torch.distributed.device_mesh import init_device_mesh  # noqa: E402
 from vllm.distributed.weight_transfer import (  # noqa: E402
     HTTPVLLMWeightSyncClient,
     WeightTransferTrainerFactory,
@@ -186,10 +186,12 @@ def run_sharded(
             f"layout {layout} needs {layout.world_size} ranks, "
             f"torchrun started {dist.get_world_size()}"
         )
-    mesh = init_device_mesh("cuda", layout.mesh_shape, mesh_dim_names=MESH_DIMS)
+    mesh, expert_mesh = build_meshes(layout, "cuda")
     started = time.perf_counter()
     rules = PlacementRules.load(args.placement_rules)
-    checkpoint = ShardedCheckpoint(manifests[0], layout, mesh, rules, device)
+    checkpoint = ShardedCheckpoint(
+        manifests[0], layout, mesh, rules, device, expert_mesh
+    )
     load_seconds = time.perf_counter() - started
     client = TimedClient(args.base_url, args.timeout)
     lifecycle = Lifecycle(args.base_url, args.timeout)

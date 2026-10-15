@@ -190,6 +190,8 @@ def _launcher_cmd(args: argparse.Namespace) -> list[str]:
             cmd += ["--env", item]
         if args.ray_address:
             cmd += ["--ray-address", args.ray_address]
+        elif args.ray_temp_dir:
+            cmd += ["--ray-temp-dir", args.ray_temp_dir]
         return [*cmd, "--"]
     return [
         args.python,
@@ -293,7 +295,7 @@ def main() -> None:
     )
     parser.add_argument("--ray-strategy", default="PACK")
     parser.add_argument(
-        "--ray-temp-dir", help="temp dir of the private Ray head (sharded_rdt)"
+        "--ray-temp-dir", help="temp dir of a Ray cluster this driver starts"
     )
     parser.add_argument("--server-gpus", default="0")
     parser.add_argument(

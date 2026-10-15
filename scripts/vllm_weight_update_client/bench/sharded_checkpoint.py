@@ -7,9 +7,16 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
-from layout import PlacementRules, TrainerLayout, pp_stages
+from layout import (
+    EXPERT_MESH_DIMS,
+    MESH_DIMS,
+    PlacementRules,
+    TrainerLayout,
+    ep_groups,
+    pp_stages,
+)
 from safetensors import safe_open
-from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import DTensor, Placement, Replicate, Shard
 from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 from vllm.distributed.weight_transfer import ParamMeta, WeightSource
@@ -47,10 +54,25 @@ def same_schema(a: CheckpointManifest, b: CheckpointManifest) -> bool:
     return _schema(a) == _schema(b)
 
 
+def build_meshes(
+    layout: TrainerLayout, device_type: str
+) -> tuple[DeviceMesh, DeviceMesh | None]:
+    """The ``(pp, dp, fsdp, tp)`` mesh, and with ep the ``(pp, ep, edp, tp)``
+    mesh over the same ranks that expert tensors live on."""
+    mesh = init_device_mesh(device_type, layout.mesh_shape, mesh_dim_names=MESH_DIMS)
+    if layout.ep == 1:
+        return mesh, None
+    expert_mesh = init_device_mesh(
+        device_type, layout.expert_mesh_shape, mesh_dim_names=EXPERT_MESH_DIMS
+    )
+    return mesh, expert_mesh
+
+
 class ShardedCheckpoint:
     """This rank's share of a checkpoint under ``layout``.
 
-    Tensors of other pipeline stages are not held. ``load`` refills the local
+    Tensors of other pipeline stages, and with ep the experts of other ep
+    groups, are not held. ``load`` refills the local
     shards in place from another checkpoint with the same schema, the way a
     training step changes the weights without moving them.
     """
@@ -62,19 +84,31 @@ class ShardedCheckpoint:
         mesh: DeviceMesh,
         rules: PlacementRules,
         device: torch.device,
+        expert_mesh: DeviceMesh | None = None,
     ) -> None:
         self.manifest = manifest
         stage = layout.pp_rank(dist.get_rank())
         stage_mesh = mesh["dp", "fsdp", "tp"]
-        stage_of = pp_stages([t.name for t in manifest.tensors], layout.pp)
+        names = [t.name for t in manifest.tensors]
+        stage_of = pp_stages(names, layout.pp)
+        group_of = ep_groups(names, layout.ep) if expert_mesh is not None else {}
+        if expert_mesh is not None:
+            ep_group = expert_mesh.get_coordinate()[1]
+            group_mesh = expert_mesh["edp", "tp"]
         self.tensors: dict[str, DTensor] = {}
         self._slices: dict[str, tuple[slice, ...]] = {}
         for meta in manifest.tensors:
             if stage_of[meta.name] != stage:
                 continue
-            placements = _placements(rules.placement_spec(meta.name, len(meta.shape)))
+            spec = rules.placement_spec(meta.name, len(meta.shape))
+            if meta.name in group_of:
+                if group_of[meta.name] != ep_group:
+                    continue
+                tensor_mesh, placements = group_mesh, _placements(spec[1:])
+            else:
+                tensor_mesh, placements = stage_mesh, _placements(spec)
             local_shape, offset = compute_local_shape_and_global_offset(
-                meta.shape, stage_mesh, placements
+                meta.shape, tensor_mesh, placements
             )
             local = torch.empty(
                 local_shape,
@@ -83,7 +117,7 @@ class ShardedCheckpoint:
             )
             self.tensors[meta.name] = DTensor.from_local(
                 local,
-                stage_mesh,
+                tensor_mesh,
                 placements,
                 run_check=False,
                 shape=torch.Size(meta.shape),

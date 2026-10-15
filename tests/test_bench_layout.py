@@ -96,24 +96,22 @@ def _sharded_worker(rank: int, world: int, port: int, ckpt: str, spec: str, q):
 
     import torch
     import torch.distributed as dist
-    from torch.distributed.device_mesh import init_device_mesh
 
     os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port))
     dist.init_process_group("gloo", rank=rank, world_size=world)
     try:
         from hf_checkpoint_nccl_publisher import CheckpointManifest
-        from layout import MESH_DIMS
-        from sharded_checkpoint import GatherSource, ShardedCheckpoint
+        from sharded_checkpoint import GatherSource, ShardedCheckpoint, build_meshes
 
         layout = TrainerLayout.parse(spec)
-        mesh = init_device_mesh("cpu", layout.mesh_shape, mesh_dim_names=MESH_DIMS)
+        mesh, expert_mesh = build_meshes(layout, "cpu")
         manifest = CheckpointManifest.load(
             model=ckpt, revision="local", checkpoint_path=ckpt
         )
         checkpoint = ShardedCheckpoint(
-            manifest, layout, mesh, PlacementRules(), torch.device("cpu")
+            manifest, layout, mesh, PlacementRules(), torch.device("cpu"), expert_mesh
         )
-        source = GatherSource(checkpoint, partial=layout.pp > 1)
+        source = GatherSource(checkpoint, partial=layout.pp > 1 or layout.ep > 1)
         # plain lists: tensors in the queue would die with this process
         out = {name: None if t is None else t.tolist() for name, t in source}
         q.put((rank, out, checkpoint.local_bytes, source.held_names()))
@@ -121,7 +119,10 @@ def _sharded_worker(rank: int, world: int, port: int, ckpt: str, spec: str, q):
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("spec", ["fsdp=2,tp=2", "dp=2,tp=2", "pp=2,fsdp=2"])
+@pytest.mark.parametrize(
+    "spec",
+    ["fsdp=2,tp=2", "dp=2,tp=2", "pp=2,fsdp=2", "fsdp=2,ep=2,tp=2", "pp=2,dp=2,ep=2"],
+)
 def test_sharded_checkpoint_gathers_back_to_the_checkpoint(tmp_path, spec):
     """Every rank reads only its slice, and full_tensor() reassembles exactly
     the checkpoint tensor, uneven shapes included."""
@@ -135,6 +136,11 @@ def test_sharded_checkpoint_gathers_back_to_the_checkpoint(tmp_path, spec):
         "model.layers.0.self_attn.o_proj.weight": torch.randn(4, 5),
         "model.layers.0.input_layernorm.weight": torch.randn(3),
         "model.layers.1.mlp.down_proj.weight": torch.randn(4, 3),
+        **{
+            f"model.layers.1.mlp.experts.{e}.{proj}.weight": torch.randn(*shape)
+            for e in range(4)
+            for proj, shape in (("gate_proj", (3, 4)), ("down_proj", (4, 3)))
+        },
         "model.norm.weight": torch.randn(4),
         "lm_head.weight": torch.randn(7, 4),
     }
@@ -165,7 +171,8 @@ def test_sharded_checkpoint_gathers_back_to_the_checkpoint(tmp_path, spec):
 
     layout = TrainerLayout.parse(spec)
     copies = {  # ranks holding a full copy of each byte: replicated dims only
-        name: layout.dp
+        # experts live on one ep group, sharded over it (edp) and tp
+        name: (1 if layout.ep > 1 and ".experts." in name else layout.dp)
         * (layout.tp if PlacementRules().tp_kind(name, t.ndim) == "rep" else 1)
         for name, t in tensors.items()
     }
@@ -175,10 +182,17 @@ def test_sharded_checkpoint_gathers_back_to_the_checkpoint(tmp_path, spec):
         assert list(out) == sorted(out, key=list(out).index)  # manifest order
         for name, full in out.items():
             if full is None:
-                assert layout.pp > 1 and name not in held
+                assert name not in held
             else:
                 assert full == tensors[name].tolist(), (rank, name)
         if layout.pp > 1:
             stage = layout.pp_rank(rank)
             assert ("model.embed_tokens.weight" in held) == (stage == 0)
             assert ("lm_head.weight" in held) == (stage == 1)
+        if layout.ep > 1:
+            stage_rank = rank % (layout.dp * layout.fsdp * layout.tp)
+            group = stage_rank // layout.tp // (layout.dp * layout.fsdp // layout.ep)
+            for e in range(4):
+                name = f"model.layers.1.mlp.experts.{e}.gate_proj.weight"
+                in_stage = layout.pp_rank(rank) == layout.pp - 1 or layout.pp == 1
+                assert (name in held) == (in_stage and e * layout.ep // 4 == group)

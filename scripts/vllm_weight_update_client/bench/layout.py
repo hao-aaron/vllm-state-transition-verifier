@@ -9,7 +9,10 @@ stage:
 - tp: ``Shard(0)`` for column-parallel tensors, ``Shard(1)`` for row-parallel
   ones, ``Replicate`` for the rest, chosen by name rules;
 - pp: decoder layers split into contiguous stages; tensors outside the layers go
-  to the first stage (embeddings) or the last (final norm, ``lm_head``).
+  to the first stage (embeddings) or the last (final norm, ``lm_head``);
+- ep: the stage's ``dp * fsdp`` ranks form ``ep`` groups, each holding a
+  contiguous block of experts on an ``[edp, tp]`` mesh, ``edp`` sharding like
+  fsdp within the group.
 
 Rank order is ``pp`` outermost, then ``dp``, ``fsdp`` and ``tp`` innermost, as
 ``init_device_mesh`` lays out ``(pp, dp, fsdp, tp)``.
@@ -26,6 +29,7 @@ from typing import Literal
 
 TpKind = Literal["col", "row", "rep"]
 MESH_DIMS = ("pp", "dp", "fsdp", "tp")
+EXPERT_MESH_DIMS = ("pp", "ep", "edp", "tp")
 
 DEFAULT_TP_RULES: tuple[tuple[str, TpKind], ...] = (
     (
@@ -37,6 +41,7 @@ DEFAULT_TP_RULES: tuple[tuple[str, TpKind], ...] = (
     (r"\.(o_proj|down_proj|dense|c_proj|fc2|w2|out_proj)\.weight$", "row"),
 )
 _LAYER_INDEX = re.compile(r"\.(?:layers|h|blocks)\.(\d+)\.")
+_EXPERT_INDEX = re.compile(r"\.experts\.(\d+)\.")
 _FIRST_STAGE = re.compile(r"(^|\.)(embed_tokens|wte|wpe|word_embeddings)\.")
 
 
@@ -77,6 +82,10 @@ class TrainerLayout:
     @property
     def mesh_shape(self) -> tuple[int, int, int, int]:
         return (self.pp, self.dp, self.fsdp, self.tp)
+
+    @property
+    def expert_mesh_shape(self) -> tuple[int, int, int, int]:
+        return (self.pp, self.ep, self.dp * self.fsdp // self.ep, self.tp)
 
     @property
     def stage_mesh_dims(self) -> int:
@@ -141,3 +150,17 @@ def pp_stages(names: Sequence[str], pp: int) -> dict[str, int]:
         else:
             stages[name] = pp - 1
     return stages
+
+
+def ep_groups(names: Sequence[str], ep: int) -> dict[str, int]:
+    """Expert-parallel group of each routed-expert tensor: experts split into
+    ``ep`` contiguous blocks. Tensors that are not experts are absent."""
+    expert_of = {}
+    for name in names:
+        match = _EXPERT_INDEX.search(name)
+        if match:
+            expert_of[name] = int(match.group(1))
+    num_experts = max(expert_of.values(), default=-1) + 1
+    if ep > 1 and num_experts < ep:
+        raise ValueError(f"ep={ep} needs at least {ep} experts, found {num_experts}")
+    return {name: e * ep // num_experts for name, e in expert_of.items()}

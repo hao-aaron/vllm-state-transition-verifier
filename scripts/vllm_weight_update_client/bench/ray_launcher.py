@@ -62,6 +62,7 @@ def main() -> None:
         "--ray-address", help="existing cluster (e.g. auto); default: start one"
     )
     parser.add_argument("--ray-namespace", default="wu-bench")
+    parser.add_argument("--ray-temp-dir", help="temp dir of a Ray cluster we start")
     parser.add_argument(
         "--env",
         action="append",
@@ -95,6 +96,7 @@ def main() -> None:
     ray.init(
         address=args.ray_address,
         namespace=args.ray_namespace,
+        _temp_dir=None if args.ray_address else args.ray_temp_dir,
         runtime_env={
             "env_vars": {
                 "PYTHONPATH": f"{HERE}:{HERE.parent}",
