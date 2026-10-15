@@ -13,6 +13,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Placement, Replicate, Shard
 from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 from vllm.distributed.weight_transfer import ParamMeta, WeightSource
+from vllm.distributed.weight_transfer.base import layerwise_groups
 from vllm.distributed.weight_transfer.m2n_common import (
     REPLICATE,
     M2NMesh,
@@ -123,25 +124,33 @@ class ShardedCheckpoint:
 
 
 class GatherSource(WeightSource):
-    """Full tensors gathered with ``full_tensor()``, in manifest order.
+    """Full tensors gathered with ``full_tensor()``.
 
-    With ``partial`` (engines with partial ownership), ``held_names`` is this
-    rank's stage and names held elsewhere yield ``None``.
+    Without ``partial`` every rank holds every tensor and iterates in manifest
+    order. With ``partial`` (engines with partial ownership, e.g. a pp stage
+    holding its layers), metadata is the manifest in ``layerwise_groups``
+    order, so each gather group is contiguous; a rank iterates only the groups
+    it holds part of, yielding ``None`` for names held elsewhere.
     """
 
     def __init__(self, checkpoint: ShardedCheckpoint, partial: bool) -> None:
         self.checkpoint = checkpoint
         self.partial = partial
-        self._metadata = [
-            ParamMeta(
+        metadata = {
+            t.name: ParamMeta(
                 t.name,
                 _SAFETENSORS_DTYPE_TO_TORCH[t.safetensors_dtype][0],
                 tuple(t.shape),
             )
             for t in checkpoint.manifest.tensors
-        ]
-        if not partial and len(checkpoint.tensors) != len(self._metadata):
-            raise ValueError("a full-ownership source must hold every tensor")
+        }
+        if partial:
+            groups = layerwise_groups(list(metadata))
+            self._metadata = [metadata[name] for g in groups for name in g]
+        else:
+            if len(checkpoint.tensors) != len(metadata):
+                raise ValueError("a full-ownership source must hold every tensor")
+            self._metadata = list(metadata.values())
 
     def metadata(self) -> list[ParamMeta]:
         return self._metadata
@@ -150,9 +159,14 @@ class GatherSource(WeightSource):
         return set(self.checkpoint.tensors) if self.partial else None
 
     def __iter__(self) -> Iterator[tuple[str, torch.Tensor | None]]:
-        for meta in self._metadata:
-            tensor = self.checkpoint.tensors.get(meta.name)
-            yield meta.name, None if tensor is None else tensor.full_tensor()
+        names = (
+            [name for g in self.groups() for name in g]
+            if self.partial
+            else [m.name for m in self._metadata]
+        )
+        for name in names:
+            tensor = self.checkpoint.tensors.get(name)
+            yield name, None if tensor is None else tensor.full_tensor()
 
 
 class ShardedM2NSource(M2NWeightSource):

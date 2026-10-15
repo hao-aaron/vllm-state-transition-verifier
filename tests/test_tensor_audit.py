@@ -74,6 +74,20 @@ def test_moved_tensor_and_memory_growth_fail():
     assert set(step["failing_checks"]) == {"moved", "memory"}
 
 
+def test_memory_growth_counted_from_memory_before():
+    """A buffer the engine allocates at the first update and keeps is not a
+    leak; growth after that is."""
+    before = _snap({"w": _entry("a")}, allocated=100)
+    after = _snap({"w": _entry("b")}, allocated=100 + (1 << 30))
+    fresh = _snap({"w": _entry("b")})
+    kept = [{"allocated": 100 + (1 << 30)}]
+    step = tensor_audit.compare_step(before, after, fresh, memory_before=kept)
+    assert step["status"] == "PASS"
+    leaked = [{"allocated": 100 + (1 << 30) - (128 << 20)}]
+    step = tensor_audit.compare_step(before, after, fresh, memory_before=leaked)
+    assert step["failing_checks"] == ["memory"]
+
+
 def test_unchanged_tensor_is_untested_not_failed():
     before = _snap({"w": _entry("a"), "norm": _entry("n")})
     after = _snap({"w": _entry("b"), "norm": _entry("n")})

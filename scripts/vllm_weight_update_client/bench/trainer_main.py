@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 
 HERE = Path(__file__).resolve().parent
-sys.path[:0] = [str(HERE), str(HERE.parent)]
+sys.path[:0] = [str(HERE), str(HERE.parent), str(HERE.parent / "validation")]
 
 import requests  # noqa: E402
 import torch  # noqa: E402
@@ -40,6 +40,7 @@ from engines import (  # noqa: E402
     ipc_init_info,
     m2n_init_info,
     nccl_init_info,
+    rdt_init_info,
     unsupported_reasons,
 )
 from layout import MESH_DIMS, PlacementRules, TrainerLayout  # noqa: E402
@@ -101,6 +102,16 @@ class Lifecycle:
         self._post("resume")
 
 
+def _server_memory(args: argparse.Namespace) -> list[dict[str, Any]] | None:
+    """Per-rank allocator stats of the server (needs the audit extension)."""
+    if not args.server_memory:
+        return None
+    import tensor_audit
+
+    snapshot = tensor_audit.fetch_snapshot(args.base_url, digests=False)
+    return [rank["memory"] for rank in snapshot]
+
+
 def _load_manifests(paths: list[str]) -> list[CheckpointManifest]:
     return [
         CheckpointManifest.load(model=p, revision="local", checkpoint_path=p)
@@ -144,13 +155,15 @@ def run_trainerless(args: argparse.Namespace, manifests: list) -> dict[str, Any]
             publisher.publish_update(target="main", manifest=manifest)
             wall = time.perf_counter() - started
             lifecycle.resume()
+            pause_window = time.perf_counter() - paused
             records.append(
                 {
                     "iteration": i,
                     "warmup": i < args.warmup,
                     "checkpoint": manifest.checkpoint_path,
                     "wall_seconds": wall,
-                    "pause_window_seconds": time.perf_counter() - paused,
+                    "pause_window_seconds": pause_window,
+                    "server_memory": _server_memory(args),
                 }
             )
     finally:
@@ -209,6 +222,8 @@ def run_sharded(
         )
         if args.backend == "ipc":
             init_info = ipc_init_info(rank=rank)
+        elif args.backend == "sharded_rdt":
+            init_info = rdt_init_info(rank=rank, server_world_size=server_world)
         else:
             init_info = nccl_init_info(**endpoint, server_world_size=server_world)
     engine = WeightTransferTrainerFactory.trainer_init(
@@ -252,6 +267,7 @@ def run_sharded(
                     "checkpoint": manifest.checkpoint_path,
                     "wall_seconds": wall,
                     "pause_window_seconds": pause_window,
+                    "server_memory": _server_memory(args),
                     "rpc_seconds": [list(call) for call in client.calls],
                     "ranks": ranks,
                 }
@@ -296,6 +312,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--nccl-master-address",
         help="address the server reaches trainer rank 0 at (default: get_ip())",
+    )
+    parser.add_argument(
+        "--server-memory",
+        action="store_true",
+        help="record server allocator stats after every sync (audit extension)",
     )
     parser.add_argument("--timeout", type=float, default=1800)
     parser.add_argument("--output", type=Path, required=True)

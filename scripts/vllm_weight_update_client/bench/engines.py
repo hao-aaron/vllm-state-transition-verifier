@@ -52,7 +52,7 @@ ENGINE_CAPS: dict[str, EngineCaps] = {
         implemented=True,
     ),
     "sharded_rdt": EngineCaps(
-        multi_sender=True, partial_ownership=True, needs_ray=True
+        multi_sender=True, partial_ownership=True, needs_ray=True, implemented=True
     ),
 }
 
@@ -115,6 +115,12 @@ def unsupported_reasons(
 SERVER_ENV: dict[str, dict[str, str]] = {
     # IPC handles travel pickled over HTTP.
     "ipc": {"VLLM_ALLOW_INSECURE_SERIALIZATION": "1"},
+    # RDT pulls into RayExecutorV2 tensor-transport actors.
+    "sharded_rdt": {"VLLM_USE_RAY_V2_EXECUTOR_BACKEND": "1"},
+}
+# vllm serve arguments each engine needs.
+SERVER_ARGS: dict[str, list[str]] = {
+    "sharded_rdt": ["--distributed-executor-backend", "ray"],
 }
 
 
@@ -161,3 +167,17 @@ def ipc_init_info(*, rank: int) -> Any:
     from vllm.distributed.weight_transfer.ipc_engine import IPCTrainerInitInfo
 
     return IPCTrainerInitInfo(rank=rank, packed=True)
+
+
+def rdt_init_info(*, rank: int, server_world_size: int) -> Any:
+    import ray
+
+    from vllm.distributed.weight_transfer.sharded_rdt_trainer import (
+        ShardedRDTTrainerInitInfo,
+    )
+
+    return ShardedRDTTrainerInitInfo(
+        rank=rank,
+        num_consumers=server_world_size,
+        trainer_actor_namespace=ray.get_runtime_context().namespace,
+    )

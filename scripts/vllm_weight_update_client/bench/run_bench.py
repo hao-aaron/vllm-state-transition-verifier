@@ -23,8 +23,11 @@ import argparse
 import hashlib
 import json
 import os
+import signal
+import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +39,7 @@ import tensor_audit  # noqa: E402
 from engines import (  # noqa: E402
     ENGINE_CAPS,
     LAUNCHERS,
+    SERVER_ARGS,
     SERVER_ENV,
     server_transfer_config,
     unsupported_reasons,
@@ -90,6 +94,11 @@ def _extra_env(args: argparse.Namespace) -> dict[str, str]:
 
 
 def _start(args: argparse.Namespace, model: str, log: Path) -> Server:
+    env = {**SERVER_ENV.get(args.backend, {}), **_extra_env(args)}
+    if ENGINE_CAPS[args.backend].needs_ray:
+        env["RAY_ADDRESS"] = args.ray_address
+        # Ray workers get the driver's PYTHONPATH (the audit extension) too.
+        env["VLLM_RAY_EXTRA_ENV_VARS_TO_COPY"] = ",".join(["PYTHONPATH", *env])
     return Server(
         model,
         log=log,
@@ -97,11 +106,80 @@ def _start(args: argparse.Namespace, model: str, log: Path) -> Server:
         gpus=args.server_gpus,
         python=args.python,
         weight_transfer_config=server_transfer_config(args.backend),
-        serve_args=args.serve_args,
+        serve_args=[*SERVER_ARGS.get(args.backend, []), *args.serve_args],
         audit=args.audit,
-        env={**SERVER_ENV.get(args.backend, {}), **_extra_env(args)},
+        env=env,
         startup_timeout=args.startup_timeout,
     )
+
+
+class RayHead:
+    """A private single-node Ray cluster for engines whose server workers and
+    trainer ranks must share one cluster (sharded_rdt)."""
+
+    def __init__(self, args: argparse.Namespace) -> None:
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        self.address = f"127.0.0.1:{port}"
+        gpus = sorted(
+            {*args.server_gpus.split(","), *args.trainer_gpus.split(",")}, key=int
+        )
+        env = dict(
+            os.environ,
+            **_extra_env(args),
+            CUDA_VISIBLE_DEVICES=",".join(gpus),
+            PYTHONPATH=os.pathsep.join(
+                [str(VALIDATION), str(HERE), str(HERE.parent)]
+                + [os.environ.get("PYTHONPATH", "")]
+            ),
+        )
+        ray = str(Path(args.python).parent / "ray")
+        cmd = [
+            ray,
+            "start",
+            "--head",
+            "--block",
+            f"--port={port}",
+            "--node-ip-address=127.0.0.1",
+            f"--num-gpus={len(gpus)}",
+            "--include-dashboard=false",
+            "--disable-usage-stats",
+        ]
+        if args.ray_temp_dir:
+            cmd.append(f"--temp-dir={args.ray_temp_dir}")
+        self.handle = (args.output_dir / "ray_head.log").open("w")
+        self.proc = subprocess.Popen(
+            cmd,
+            env=env,
+            stdout=self.handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
+            if self.proc.poll() is not None:
+                raise RuntimeError("ray head exited, see ray_head.log")
+            status = subprocess.run(
+                [ray, "status", f"--address={self.address}"],
+                capture_output=True,
+                check=False,
+            )
+            if status.returncode == 0:
+                return
+            time.sleep(2)
+        self.stop()
+        raise TimeoutError("ray head did not come up, see ray_head.log")
+
+    def stop(self) -> None:
+        if self.proc.poll() is None:
+            os.killpg(self.proc.pid, signal.SIGTERM)
+            try:
+                self.proc.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                os.killpg(self.proc.pid, signal.SIGKILL)
+                self.proc.wait()
+        self.handle.close()
 
 
 def _launcher_cmd(args: argparse.Namespace) -> list[str]:
@@ -145,6 +223,8 @@ def run_trainer(args: argparse.Namespace, base_url: str) -> dict[str, Any]:
         cmd += ["--checkpoint", checkpoint]
     if args.placement_rules:
         cmd += ["--placement-rules", str(args.placement_rules)]
+    if args.audit:
+        cmd.append("--server-memory")
     env = dict(os.environ, **_extra_env(args), CUDA_VISIBLE_DEVICES=args.trainer_gpus)
     log = args.output_dir / "trainer.log"
     with log.open("w") as handle:
@@ -175,6 +255,14 @@ def render_report(result: dict[str, Any], audit: dict[str, Any] | None) -> str:
         f"{s['gib_per_second_median']:.2f} | "
         f"{s['pause_window_seconds_median']:.3f} |",
     ]
+    resident = (audit or {}).get("steps", [{}])[0].get("engine_resident_bytes")
+    if resident:
+        lines += [
+            "",
+            "Engine-resident server memory after the first sync (per rank): "
+            + ", ".join(f"{b / 2**20:.0f} MiB" for b in resident)
+            + "; growth is checked from there.",
+        ]
     if audit is not None:
         lines += ["", tensor_audit.render_markdown(audit)]
     return "\n".join(lines) + "\n"
@@ -204,6 +292,9 @@ def main() -> None:
         help="Ray cluster for --launcher ray (default: a local one on --trainer-gpus)",
     )
     parser.add_argument("--ray-strategy", default="PACK")
+    parser.add_argument(
+        "--ray-temp-dir", help="temp dir of the private Ray head (sharded_rdt)"
+    )
     parser.add_argument("--server-gpus", default="0")
     parser.add_argument(
         "--trainer-gpus",
@@ -252,34 +343,57 @@ def main() -> None:
             parser.error(f"{args.backend} needs trainer and server on separate GPUs")
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    audit = None
-    if args.base_url:
-        result = run_trainer(args, args.base_url)
-    else:
-        server = _start(args, args.model_a, args.output_dir / "server.log")
-        try:
-            version = get_json(f"{server.url}/version").get("version")
+    ray_head = None
+    if ENGINE_CAPS[args.backend].needs_ray and not args.ray_address:
+        if args.base_url:
+            parser.error(f"{args.backend} with --base-url needs --ray-address")
+        ray_head = RayHead(args)
+        args.ray_address = ray_head.address
+    try:
+        audit = None
+        if args.base_url:
+            result = run_trainer(args, args.base_url)
+        else:
+            server = _start(args, args.model_a, args.output_dir / "server.log")
+            try:
+                version = get_json(f"{server.url}/version").get("version")
+                if args.audit:
+                    before = _snapshot_pair(
+                        server.url, server.model, args.output_dir, "before"
+                    )
+                result = run_trainer(args, server.url)
+                if args.audit:
+                    after = _snapshot_pair(
+                        server.url, server.model, args.output_dir, "after"
+                    )
+            finally:
+                server.stop()
             if args.audit:
-                before = _snapshot_pair(
-                    server.url, server.model, args.output_dir, "before"
+                fresh = _fresh_snapshots(args, result["final_checkpoint"], version)
+                runtime = {kind: set() for kind in tensor_audit.KINDS}
+                for first, second in (before, after, fresh):
+                    for kind, names in tensor_audit.runtime_names(
+                        first, second
+                    ).items():
+                        runtime[kind] |= names
+                # Leak check from after the first sync: engines may keep buffers
+                # they allocate once (RDT receive rings); that is reported as
+                # engine-resident memory, not counted as growth.
+                first = result["iterations"][0]["server_memory"]
+                step = tensor_audit.compare_step(
+                    before[1], after[0], fresh[0], runtime, memory_before=first
                 )
-            result = run_trainer(args, server.url)
-            if args.audit:
-                after = _snapshot_pair(
-                    server.url, server.model, args.output_dir, "after"
-                )
-        finally:
-            server.stop()
-        if args.audit:
-            fresh = _fresh_snapshots(args, result["final_checkpoint"], version)
-            runtime = {kind: set() for kind in tensor_audit.KINDS}
-            for first, second in (before, after, fresh):
-                for kind, names in tensor_audit.runtime_names(first, second).items():
-                    runtime[kind] |= names
-            step = tensor_audit.compare_step(before[1], after[0], fresh[0], runtime)
-            step["name"] = f"after {len(result['iterations'])} syncs"
-            audit = {"status": step["status"], "steps": [step]}
-            result["audit"] = audit
+                step["engine_resident_bytes"] = [
+                    m["allocated"] - b["memory"]["allocated"]
+                    for m, b in zip(first, before[1], strict=True)
+                ]
+                step["name"] = f"after {len(result['iterations'])} syncs"
+                audit = {"status": step["status"], "steps": [step]}
+                result["audit"] = audit
+
+    finally:
+        if ray_head is not None:
+            ray_head.stop()
 
     result["serve_args"] = serve_args
     (args.output_dir / "result.json").write_text(json.dumps(result, indent=2) + "\n")

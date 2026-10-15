@@ -146,6 +146,11 @@ Engines driven today:
 | `nccl` | separate from the server | dp, fsdp, tp | one sender: pp and ep refused |
 | `nccl_m2n` | separate from the server | dp with fsdp *or* tp | no gather; a tensor shards over one mesh axis; needs `nccl-extensions` and NCCL ≥ 2.30.5 |
 | `ipc` | the server's GPUs (`--trainer-gpus` = `--server-gpus`) | dp, fsdp, tp | server gets `VLLM_ALLOW_INSECURE_SERIALIZATION=1` |
+| `sharded_rdt` | separate from the server | dp, fsdp, tp, pp | `--launcher ray` only; the driver starts a private Ray head (`--ray-temp-dir`) that the server (Ray executor) and trainer share, or joins `--ray-address`; needs `nixl` |
+
+With `--audit`, the trainer records server allocator stats after every sync.
+Memory an engine allocates during the first sync and keeps (RDT's receive
+rings) is reported as engine-resident; the leak check runs from there.
 
 `--env KEY=VALUE` reaches the server and every trainer rank (torchrun or Ray).
 nccl_m2n needs the NCCL its `libnccl_m2n.so` was built against in every

@@ -92,9 +92,14 @@ def compare_step(
     fresh: Snapshot,
     runtime: dict[str, set[str]] | None = None,
     memory_growth_limit: int = DEFAULT_MEMORY_GROWTH_LIMIT,
+    memory_before: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """One update step: `before` and `after` come from the server under test,
-    `fresh` from a server started on the checkpoint the update sent."""
+    `fresh` from a server started on the checkpoint the update sent.
+
+    Memory growth is measured from `before`, or from `memory_before` (per-rank
+    allocator stats) when given: e.g. taken after a first update, so buffers an
+    engine allocates once and keeps are not counted as a leak."""
     runtime = runtime or {kind: set() for kind in KINDS}
     findings: dict[str, Any] = {
         "mismatched": {k: [] for k in KINDS},
@@ -143,7 +148,12 @@ def compare_step(
                 tag + n for n in sorted(b.keys() - a.keys())
             ]
             findings["appeared"][kind] += [tag + n for n in sorted(a.keys() - b.keys())]
-        mb, ma = before[rank].get("memory", {}), after[rank].get("memory", {})
+        mb = (
+            memory_before[rank]
+            if memory_before is not None
+            else before[rank].get("memory", {})
+        )
+        ma = after[rank].get("memory", {})
         if "allocated" in mb and "allocated" in ma:
             growth = ma["allocated"] - mb["allocated"]
             findings["memory"].append(
