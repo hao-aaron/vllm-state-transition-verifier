@@ -139,8 +139,18 @@ python $B/run_bench.py --model-a <A-dir> --update <B-dir> --update <C-dir> \
   -- --tensor-parallel-size 2 --max-model-len 2048 --gpu-memory-utilization 0.5
 ```
 
-Engines: `nccl` is driven today; `nccl_m2n`, `ipc` and `sharded_rdt` are listed
-in `ENGINE_CAPS` and refused until the harness drives them.
+Engines driven today:
+
+| Engine | Trainer GPUs | Layouts | Notes |
+|---|---|---|---|
+| `nccl` | separate from the server | dp, fsdp, tp | one sender: pp and ep refused |
+| `nccl_m2n` | separate from the server | dp with fsdp *or* tp | no gather; a tensor shards over one mesh axis; needs `nccl-extensions` and NCCL ≥ 2.30.5 |
+| `ipc` | the server's GPUs (`--trainer-gpus` = `--server-gpus`) | dp, fsdp, tp | server gets `VLLM_ALLOW_INSECURE_SERIALIZATION=1` |
+
+`--env KEY=VALUE` reaches the server and every trainer rank (torchrun or Ray).
+nccl_m2n needs the NCCL its `libnccl_m2n.so` was built against in every
+process, e.g. a 2.30.x `libnccl.so.2` unpacked from the `nvidia-nccl-cu13`
+wheel: `--env LD_PRELOAD=<lib> --env VLLM_NCCL_SO_PATH=<lib>`.
 
 ## 2. Source snapshot — `scripts/rl_source_snapshot.py`
 

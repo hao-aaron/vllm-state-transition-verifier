@@ -37,11 +37,17 @@ import torch  # noqa: E402
 import torch.distributed as dist  # noqa: E402
 from engines import (  # noqa: E402
     ENGINE_CAPS,
+    ipc_init_info,
+    m2n_init_info,
     nccl_init_info,
     unsupported_reasons,
 )
 from layout import MESH_DIMS, PlacementRules, TrainerLayout  # noqa: E402
-from sharded_checkpoint import GatherSource, ShardedCheckpoint  # noqa: E402
+from sharded_checkpoint import (  # noqa: E402
+    GatherSource,
+    ShardedCheckpoint,
+    ShardedM2NSource,
+)
 from torch.distributed.device_mesh import init_device_mesh  # noqa: E402
 from vllm.distributed.weight_transfer import (  # noqa: E402
     HTTPVLLMWeightSyncClient,
@@ -169,38 +175,44 @@ def run_sharded(
         )
     mesh = init_device_mesh("cuda", layout.mesh_shape, mesh_dim_names=MESH_DIMS)
     started = time.perf_counter()
-    checkpoint = ShardedCheckpoint(
-        manifests[0],
-        layout,
-        mesh,
-        PlacementRules.load(args.placement_rules),
-        device,
-    )
+    rules = PlacementRules.load(args.placement_rules)
+    checkpoint = ShardedCheckpoint(manifests[0], layout, mesh, rules, device)
     load_seconds = time.perf_counter() - started
-    source = GatherSource(
-        checkpoint, partial=ENGINE_CAPS[args.backend].partial_ownership
-    )
     client = TimedClient(args.base_url, args.timeout)
     lifecycle = Lifecycle(args.base_url, args.timeout)
 
     rendezvous: list[Any] = [None]
     if rank == 0:
-        server_world = requests.get(
-            f"{args.base_url.rstrip('/')}/get_world_size", timeout=args.timeout
-        ).json()["world_size"]
+        url = args.base_url.rstrip("/")
+        server_world, server_tp = (
+            requests.get(
+                f"{url}/get_world_size?include_dp={include_dp}", timeout=args.timeout
+            ).json()["world_size"]
+            for include_dp in ("true", "false")
+        )
         address = args.nccl_master_address or get_ip()
-        rendezvous = [(address, get_open_port(), server_world)]
+        rendezvous = [(address, get_open_port(), server_world, server_tp)]
     dist.broadcast_object_list(rendezvous, src=0)
-    address, port, server_world = rendezvous[0]
-    engine = WeightTransferTrainerFactory.trainer_init(
-        nccl_init_info(
-            rank=rank,
-            master_address=address,
-            master_port=port,
+    address, port, server_world, server_tp = rendezvous[0]
+    endpoint = {"rank": rank, "master_address": address, "master_port": port}
+    if args.backend == "nccl_m2n":
+        source = ShardedM2NSource(checkpoint, layout, rules)
+        init_info = m2n_init_info(
+            **endpoint,
+            layout=layout,
             server_world_size=server_world,
-        ),
-        client=client,
-        source=source,
+            server_tp=server_tp,
+        )
+    else:
+        source = GatherSource(
+            checkpoint, partial=ENGINE_CAPS[args.backend].partial_ownership
+        )
+        if args.backend == "ipc":
+            init_info = ipc_init_info(rank=rank)
+        else:
+            init_info = nccl_init_info(**endpoint, server_world_size=server_world)
+    engine = WeightTransferTrainerFactory.trainer_init(
+        init_info, client=client, source=source
     )
 
     records = []

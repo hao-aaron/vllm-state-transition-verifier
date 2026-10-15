@@ -34,7 +34,9 @@ sys.path[:0] = [str(HERE), str(VALIDATION)]
 
 import tensor_audit  # noqa: E402
 from engines import (  # noqa: E402
+    ENGINE_CAPS,
     LAUNCHERS,
+    SERVER_ENV,
     server_transfer_config,
     unsupported_reasons,
 )
@@ -83,6 +85,10 @@ def _fresh_snapshots(args: argparse.Namespace, checkpoint: str, version: str) ->
         server.stop()
 
 
+def _extra_env(args: argparse.Namespace) -> dict[str, str]:
+    return dict(item.split("=", 1) for item in args.env)
+
+
 def _start(args: argparse.Namespace, model: str, log: Path) -> Server:
     return Server(
         model,
@@ -93,6 +99,7 @@ def _start(args: argparse.Namespace, model: str, log: Path) -> Server:
         weight_transfer_config=server_transfer_config(args.backend),
         serve_args=args.serve_args,
         audit=args.audit,
+        env={**SERVER_ENV.get(args.backend, {}), **_extra_env(args)},
         startup_timeout=args.startup_timeout,
     )
 
@@ -101,6 +108,8 @@ def _launcher_cmd(args: argparse.Namespace) -> list[str]:
     if args.launcher == "ray":
         cmd = [args.python, str(HERE / "ray_launcher.py")]
         cmd += ["--ray-strategy", args.ray_strategy]
+        for item in args.env:
+            cmd += ["--env", item]
         if args.ray_address:
             cmd += ["--ray-address", args.ray_address]
         return [*cmd, "--"]
@@ -136,7 +145,7 @@ def run_trainer(args: argparse.Namespace, base_url: str) -> dict[str, Any]:
         cmd += ["--checkpoint", checkpoint]
     if args.placement_rules:
         cmd += ["--placement-rules", str(args.placement_rules)]
-    env = dict(os.environ, CUDA_VISIBLE_DEVICES=args.trainer_gpus)
+    env = dict(os.environ, **_extra_env(args), CUDA_VISIBLE_DEVICES=args.trainer_gpus)
     log = args.output_dir / "trainer.log"
     with log.open("w") as handle:
         rc = subprocess.run(
@@ -181,6 +190,14 @@ def main() -> None:
     parser.add_argument("--backend", default="nccl")
     parser.add_argument("--layout", default="", help='e.g. "fsdp=2" or "trainerless"')
     parser.add_argument("--placement-rules", type=Path)
+    parser.add_argument(
+        "--env",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="environment variable for the server and every trainer rank "
+        "(e.g. LD_PRELOAD / VLLM_NCCL_SO_PATH for nccl_m2n); repeatable",
+    )
     parser.add_argument("--launcher", choices=LAUNCHERS, default="torchrun")
     parser.add_argument(
         "--ray-address",
@@ -226,6 +243,13 @@ def main() -> None:
     trainer_gpus = args.trainer_gpus.split(",")
     if not args.ray_address and len(trainer_gpus) != _trainer_world_size(args.layout):
         parser.error(f"--trainer-gpus lists {len(trainer_gpus)} GPUs for {args.layout}")
+    if not args.base_url and not args.ray_address:
+        server_gpus = set(args.server_gpus.split(","))
+        caps = ENGINE_CAPS[args.backend]
+        if caps.colocated_only and set(trainer_gpus) != server_gpus:
+            parser.error(f"{args.backend} needs --trainer-gpus == --server-gpus")
+        if not caps.colocated_only and set(trainer_gpus) & server_gpus:
+            parser.error(f"{args.backend} needs trainer and server on separate GPUs")
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     audit = None
@@ -268,6 +292,7 @@ def main() -> None:
         "trainer_world_size": result["trainer"]["world_size"],
         "server_world_size": result["server_world_size"],
         "serve_args": serve_args,
+        "env": args.env,
         "total_bytes": result["total_bytes"],
         "vllm_version": result["vllm_version"],
         "audit": audit["status"] if audit else None,

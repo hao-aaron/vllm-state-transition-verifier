@@ -86,6 +86,9 @@ def test_engines_report_what_they_cannot_serve():
         "mesh dims" in r
         for r in unsupported_reasons(TrainerLayout(dp=2, fsdp=2, tp=2), "nccl_m2n")
     )
+    m2n_2d = unsupported_reasons(TrainerLayout(fsdp=2, tp=2), "nccl_m2n")
+    assert any("fsdp and tp both shard" in r for r in m2n_2d)
+    assert unsupported_reasons(TrainerLayout(dp=2, fsdp=2), "nccl_m2n") == []
 
 
 def _sharded_worker(rank: int, world: int, port: int, ckpt: str, spec: str, q):

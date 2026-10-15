@@ -63,6 +63,13 @@ def main() -> None:
     )
     parser.add_argument("--ray-namespace", default="wu-bench")
     parser.add_argument(
+        "--env",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="environment variable for every trainer actor; repeatable",
+    )
+    parser.add_argument(
         "--ray-strategy",
         default="PACK",
         choices=("PACK", "SPREAD", "STRICT_PACK", "STRICT_SPREAD"),
@@ -88,7 +95,12 @@ def main() -> None:
     ray.init(
         address=args.ray_address,
         namespace=args.ray_namespace,
-        runtime_env={"env_vars": {"PYTHONPATH": f"{HERE}:{HERE.parent}"}},
+        runtime_env={
+            "env_vars": {
+                "PYTHONPATH": f"{HERE}:{HERE.parent}",
+                **dict(item.split("=", 1) for item in args.env),
+            }
+        },
     )
     group = placement_group(
         [{"GPU": 1, "CPU": 1}] * world_size, strategy=args.ray_strategy

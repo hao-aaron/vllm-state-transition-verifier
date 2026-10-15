@@ -13,6 +13,12 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Placement, Replicate, Shard
 from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 from vllm.distributed.weight_transfer import ParamMeta, WeightSource
+from vllm.distributed.weight_transfer.m2n_common import (
+    REPLICATE,
+    M2NMesh,
+    M2NParamMeta,
+)
+from vllm.distributed.weight_transfer.m2n_source import M2NWeightSource
 
 from hf_checkpoint_nccl_publisher import (
     _SAFETENSORS_DTYPE_TO_TORCH,
@@ -147,3 +153,49 @@ class GatherSource(WeightSource):
         for meta in self._metadata:
             tensor = self.checkpoint.tensors.get(meta.name)
             yield meta.name, None if tensor is None else tensor.full_tensor()
+
+
+class ShardedM2NSource(M2NWeightSource):
+    """Local shards and their placements, for nccl_m2n (no gather).
+
+    m2n meshes have two axes, so the stage mesh's size-1 dimensions are dropped;
+    ``engines.unsupported_reasons`` has already refused layouts that need more.
+    """
+
+    def __init__(
+        self,
+        checkpoint: ShardedCheckpoint,
+        layout: TrainerLayout,
+        rules: PlacementRules,
+    ) -> None:
+        self.checkpoint = checkpoint
+        sizes = (layout.dp, layout.fsdp, layout.tp)
+        axes = [i for i, size in enumerate(sizes) if size > 1]
+        if len(axes) > 2:
+            raise ValueError(f"nccl_m2n cannot describe layout {layout}")
+        dims = [sizes[i] for i in axes] + [1] * (2 - len(axes))
+        self._mesh = M2NMesh((dims[0], dims[1]), 0)
+        self._metadata = []
+        for t in checkpoint.manifest.tensors:
+            spec = rules.placement_spec(t.name, len(t.shape))
+            codes = [REPLICATE if spec[i] == "R" else int(spec[i][1:]) for i in axes]
+            codes += [REPLICATE] * (2 - len(codes))
+            placements = None if codes == [REPLICATE, REPLICATE] else tuple(codes)
+            self._metadata.append(
+                M2NParamMeta(
+                    t.name,
+                    _SAFETENSORS_DTYPE_TO_TORCH[t.safetensors_dtype][0],
+                    tuple(t.shape),
+                    placements,
+                )
+            )
+
+    def mesh(self) -> M2NMesh:
+        return self._mesh
+
+    def metadata(self) -> list[ParamMeta]:
+        return self._metadata
+
+    def __iter__(self) -> Iterator[tuple[str, torch.Tensor]]:
+        for meta in self._metadata:
+            yield meta.name, self.checkpoint.tensors[meta.name].to_local()
