@@ -168,6 +168,14 @@ def test_perturbation_changes_every_payload_and_keeps_metadata():
         "experts.scales", torch.full((4,), 0xFE, dtype=torch.uint8), 1, 0.03
     )
     assert not torch.any(blocks == 0xFF)  # e8m0 NaN
+    # A server rounding block scales to powers of two (UE8M0) must still see
+    # them change.
+    scale = torch.full((4,), 0.3, dtype=torch.bfloat16)
+    pow2 = lambda x: torch.exp2(torch.ceil(torch.log2(x.float())))  # noqa: E731
+    variants = [scale] + [
+        perturb_tensor("x.weight_scale", scale, k, 1 / 32)[0] for k in (1, 2)
+    ]
+    assert len({pow2(v)[0].item() for v in variants}) == 3
     for name, t in {
         "layer.g_idx": torch.arange(8, dtype=torch.int32),
         "layer.weight_shape": torch.tensor([4, 8]),

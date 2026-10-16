@@ -10,7 +10,9 @@ alphas, ``1 / a_scale``, FlashInfer bmm scales). This tool changes every tensor
 it can change without breaking the checkpoint's structure:
 
 - floating point (bf16/fp16/fp32/fp64): scaled by ``1 + k * eps``; a tensor
-  that is all zeros gets ``k * eps`` added;
+  that is all zeros gets ``k * eps`` added; quantization scales (``*scale*``)
+  are scaled by ``2 ** k`` instead, since servers may round them to powers of
+  two (UE8M0 block scales), which absorbs a small relative change;
 - float8 (e4m3/e5m2): scaled through float32 and clamped to the dtype's range;
 - float8_e8m0 and 1-byte integer payloads (packed FP4/MXFP4 blocks, e8m0
   scales stored as uint8, int8 weights): low bits flipped (``xor k``), keeping
@@ -88,7 +90,7 @@ def perturb_tensor(
     if t.is_floating_point():
         if not torch.any(t != 0):
             return t + variant * eps, f"zeros + {variant * eps:g}"
-        factor = 1.0 + variant * eps
+        factor = 2.0**variant if "scale" in leaf else 1.0 + variant * eps
         out = (t.to(torch.float32) * factor).to(t.dtype)
         return out, f"x{factor:g}"
     return t, f"unchanged: unsupported dtype {t.dtype}"
