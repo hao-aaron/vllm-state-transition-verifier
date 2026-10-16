@@ -124,6 +124,9 @@ DTensors on a `(pp, dp, fsdp, tp)` mesh.
 | `ray_launcher.py` | Runs the same ranks as Ray actors in a placement group (multi-node via `--ray-address`) |
 | `run_bench.py` | Driver: server (or `--base-url`), trainer, `result.json`, `report.md`, a row in `results.jsonl`; `--audit` adds the refit-equals-fresh audit |
 
+Usage, requirements, outputs, tested recipes and known problems:
+[`bench/README.md`](scripts/vllm_weight_update_client/bench/README.md).
+
 `--launcher torchrun|ray` is independent of the engine, except that engines whose
 trainer ranks must be Ray actors (`sharded_rdt`) only run under Ray. The harness
 does not work around what an engine cannot do: `nccl` has a single sender, so a
