@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -20,7 +21,7 @@ from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import DTensor, Placement, Replicate, Shard
 from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 from vllm.distributed.weight_transfer import ParamMeta, WeightSource
-from vllm.distributed.weight_transfer.base import layerwise_groups
+from vllm.distributed.weight_transfer.base import _stack_key, layerwise_groups
 from vllm.distributed.weight_transfer.m2n_common import (
     REPLICATE,
     M2NMesh,
@@ -157,19 +158,94 @@ class ShardedCheckpoint:
         self.manifest = manifest
 
 
+def _chunk_len(length: int, n: int, index: int) -> int:
+    size = -(-length // n)
+    return max(0, min(size, length - index * size))
+
+
+def gather_full(tensors: list[DTensor]) -> list[torch.Tensor]:
+    """Full tensors of ``tensors``, gathered the way FSDP2 unshards a module:
+    per mesh and sharded mesh dim, every tensor's shard is packed into one
+    buffer and all-gathered in one collective, instead of a ``full_tensor()``
+    each.
+
+    The ranks of each mesh dim's group must pass the same tensors of that mesh
+    in the same order, which holds for one layer's names.
+    """
+    full: list[torch.Tensor] = [t.to_local() for t in tensors]
+    by_mesh: dict[tuple[str, ...], list[int]] = {}
+    for i, t in enumerate(tensors):
+        by_mesh.setdefault(t.device_mesh.mesh_dim_names, []).append(i)
+    # one mesh order on every rank, so ranks in two meshes issue collectives alike
+    for dims in sorted(by_mesh):
+        idx = by_mesh[dims]
+        mesh = tensors[idx[0]].device_mesh
+        coord = mesh.get_coordinate()
+        for d in reversed(range(mesh.ndim)):  # undo the innermost split first
+            n = mesh.size(d)
+            if n == 1:
+                continue
+            plan = []
+            for i in idx:
+                placement = tensors[i].placements[d]
+                if not isinstance(placement, Shard):
+                    continue
+                k = placement.dim
+                length = tensors[i].shape[k]
+                for e in range(d):
+                    outer = tensors[i].placements[e]
+                    if isinstance(outer, Shard) and outer.dim == k:
+                        length = _chunk_len(length, mesh.size(e), coord[e])
+                rows = full[i].movedim(k, 0)
+                pad = -(-length // n)
+                if rows.shape[0] == pad:
+                    padded = rows.contiguous()
+                else:
+                    padded = rows.new_zeros((pad, *rows.shape[1:]))
+                    padded[: rows.shape[0]] = rows
+                plan.append((i, k, length, padded))
+            if not plan:
+                continue
+            sizes = [p[3].numel() * p[3].element_size() for p in plan]
+            offsets = list(itertools.accumulate((-(-s // 16) * 16 for s in sizes)))
+            buf = torch.empty(offsets[-1], dtype=torch.uint8, device=full[0].device)
+            offsets = [0, *offsets[:-1]]
+            for (_, _, _, padded), off, size in zip(plan, offsets, sizes):
+                buf[off : off + size] = padded.reshape(-1).view(torch.uint8)
+            out = buf.new_empty(n * buf.numel())
+            dist.all_gather_into_tensor(out, buf, group=mesh.get_group(d))
+            out = out.view(n, -1)
+            for (i, k, length, padded), off, size in zip(plan, offsets, sizes):
+                pieces = [
+                    out[r, off : off + size]
+                    .view(padded.dtype)
+                    .view(padded.shape)[: _chunk_len(length, n, r)]
+                    for r in range(n)
+                ]
+                full[i] = torch.cat(pieces).movedim(0, k)
+    return [t.contiguous() for t in full]
+
+
 class GatherSource(WeightSource):
-    """Full tensors gathered with ``full_tensor()``.
+    """Full tensors, gathered one layer at a time.
 
     Without ``partial`` every rank holds every tensor and iterates in manifest
     order. With ``partial`` (engines with partial ownership, e.g. a pp stage
     holding its layers), metadata is the manifest in ``layerwise_groups``
     order, so each gather group is contiguous; a rank iterates only the groups
     it holds part of, yielding ``None`` for names held elsewhere.
+
+    ``batched`` gathers each layer with ``gather_full``, as an FSDP2 trainer
+    unshards a module; without it each tensor is gathered by its own
+    ``full_tensor()``.
     """
 
-    def __init__(self, checkpoint: ShardedCheckpoint, partial: bool) -> None:
+    def __init__(
+        self, checkpoint: ShardedCheckpoint, partial: bool, batched: bool = True
+    ) -> None:
         self.checkpoint = checkpoint
         self.partial = partial
+        self.batched = batched
         metadata = {
             t.name: ParamMeta(
                 t.name,
@@ -198,9 +274,30 @@ class GatherSource(WeightSource):
             if self.partial
             else [m.name for m in self._metadata]
         )
-        for name in names:
-            tensor = self.checkpoint.tensors.get(name)
-            yield name, None if tensor is None else tensor.full_tensor()
+        if not self.batched:
+            for name in names:
+                tensor = self.checkpoint.tensors.get(name)
+                yield name, None if tensor is None else tensor.full_tensor()
+            return
+        for _, layer in itertools.groupby(names, key=_stack_key):
+            layer = list(layer)
+            held = [n for n in layer if n in self.checkpoint.tensors]
+            full = gather_full([self.checkpoint.tensors[n] for n in held])
+            gathered = dict(zip(held, full))
+            ready = None
+            if full and full[0].is_cuda:
+                ready = torch.cuda.Event()
+                ready.record()
+            for name in layer:
+                tensor = gathered.pop(name, None)
+                # the layer was gathered on the stream current at its first
+                # next(); a consumer may resume us on another (the packed nccl
+                # sender switches streams per chunk)
+                if tensor is not None and ready is not None:
+                    stream = torch.cuda.current_stream()
+                    stream.wait_event(ready)
+                    tensor.record_stream(stream)
+                yield name, tensor
 
 
 class ShardedM2NSource(M2NWeightSource):

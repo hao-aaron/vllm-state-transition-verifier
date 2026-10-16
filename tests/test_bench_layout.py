@@ -91,7 +91,9 @@ def test_engines_report_what_they_cannot_serve():
     assert unsupported_reasons(TrainerLayout(dp=2, fsdp=2), "nccl_m2n") == []
 
 
-def _sharded_worker(rank: int, world: int, port: int, ckpt: str, spec: str, q):
+def _sharded_worker(
+    rank: int, world: int, port: int, ckpt: str, spec: str, batched: bool, q
+):
     import os
 
     import torch
@@ -111,7 +113,9 @@ def _sharded_worker(rank: int, world: int, port: int, ckpt: str, spec: str, q):
         checkpoint = ShardedCheckpoint(
             manifest, layout, mesh, PlacementRules(), torch.device("cpu"), expert_mesh
         )
-        source = GatherSource(checkpoint, partial=layout.pp > 1 or layout.ep > 1)
+        source = GatherSource(
+            checkpoint, partial=layout.pp > 1 or layout.ep > 1, batched=batched
+        )
         # plain lists: tensors in the queue would die with this process
         out = {name: None if t is None else t.tolist() for name, t in source}
         q.put((rank, out, checkpoint.local_bytes, source.held_names()))
@@ -119,13 +123,15 @@ def _sharded_worker(rank: int, world: int, port: int, ckpt: str, spec: str, q):
         dist.destroy_process_group()
 
 
+@pytest.mark.parametrize("batched", [True, False], ids=["per-layer", "per-tensor"])
 @pytest.mark.parametrize(
     "spec",
     ["fsdp=2,tp=2", "dp=2,tp=2", "pp=2,fsdp=2", "fsdp=2,ep=2,tp=2", "pp=2,dp=2,ep=2"],
 )
-def test_sharded_checkpoint_gathers_back_to_the_checkpoint(tmp_path, spec):
-    """Every rank reads only its slice, and full_tensor() reassembles exactly
-    the checkpoint tensor, uneven shapes included."""
+def test_sharded_checkpoint_gathers_back_to_the_checkpoint(tmp_path, spec, batched):
+    """Every rank reads only its slice, and both the per-layer gather and
+    full_tensor() reassemble exactly the checkpoint tensor, uneven shapes
+    included."""
     torch = pytest.importorskip("torch")
     pytest.importorskip("vllm")
     from safetensors.torch import save_file
@@ -158,7 +164,8 @@ def test_sharded_checkpoint_gathers_back_to_the_checkpoint(tmp_path, spec):
     q = ctx.SimpleQueue()
     procs = [
         ctx.Process(
-            target=_sharded_worker, args=(r, world, port, str(tmp_path), spec, q)
+            target=_sharded_worker,
+            args=(r, world, port, str(tmp_path), spec, batched, q),
         )
         for r in range(world)
     ]

@@ -225,6 +225,7 @@ def run_trainer(args: argparse.Namespace, base_url: str) -> dict[str, Any]:
         cmd += ["--checkpoint", checkpoint]
     if args.placement_rules:
         cmd += ["--placement-rules", str(args.placement_rules)]
+    cmd += ["--gather", args.gather]
     if args.audit:
         cmd.append("--server-memory")
     env = dict(os.environ, **_extra_env(args), CUDA_VISIBLE_DEVICES=args.trainer_gpus)
@@ -280,6 +281,12 @@ def main() -> None:
     parser.add_argument("--backend", default="nccl")
     parser.add_argument("--layout", default="", help='e.g. "fsdp=2" or "trainerless"')
     parser.add_argument("--placement-rules", type=Path)
+    parser.add_argument(
+        "--gather",
+        choices=("layer", "tensor"),
+        default="layer",
+        help="trainer gather granularity (see trainer_main.py --gather)",
+    )
     parser.add_argument(
         "--env",
         action="append",

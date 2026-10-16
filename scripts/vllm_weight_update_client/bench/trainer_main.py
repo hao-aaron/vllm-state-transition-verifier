@@ -220,7 +220,9 @@ def run_sharded(
         )
     else:
         source = GatherSource(
-            checkpoint, partial=ENGINE_CAPS[args.backend].partial_ownership
+            checkpoint,
+            partial=ENGINE_CAPS[args.backend].partial_ownership,
+            batched=args.gather == "layer",
         )
         if args.backend == "ipc":
             init_info = ipc_init_info(rank=rank)
@@ -285,6 +287,7 @@ def run_sharded(
         "trainer": {
             "layout": str(layout),
             "world_size": layout.world_size,
+            "gather": args.gather,
             "load_seconds": load_seconds,
             "local_bytes_per_rank": local_bytes,
         },
@@ -319,6 +322,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--server-memory",
         action="store_true",
         help="record server allocator stats after every sync (audit extension)",
+    )
+    parser.add_argument(
+        "--gather",
+        choices=("layer", "tensor"),
+        default="layer",
+        help="gather sharded weights one collective per layer, like FSDP2 "
+        "(default), or one full_tensor() per tensor",
     )
     parser.add_argument("--timeout", type=float, default=1800)
     parser.add_argument("--output", type=Path, required=True)
