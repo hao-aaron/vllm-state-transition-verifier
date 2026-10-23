@@ -45,6 +45,8 @@ from engines import (  # noqa: E402
 )
 from layout import PlacementRules, TrainerLayout  # noqa: E402
 from sharded_checkpoint import (  # noqa: E402
+    DeclaredGatherSource,
+    DeclaredM2NSource,
     GatherSource,
     ShardedCheckpoint,
     ShardedM2NSource,
@@ -210,8 +212,12 @@ def run_sharded(
     dist.broadcast_object_list(rendezvous, src=0)
     address, port, server_world, server_tp = rendezvous[0]
     endpoint = {"rank": rank, "master_address": address, "master_port": port}
+    declared = args.source_api == "declared"
     if args.backend == "nccl_m2n":
-        source = ShardedM2NSource(checkpoint, layout, rules)
+        if declared:
+            source = DeclaredM2NSource(checkpoint)
+        else:
+            source = ShardedM2NSource(checkpoint, layout, rules)
         init_info = m2n_init_info(
             **endpoint,
             layout=layout,
@@ -219,11 +225,14 @@ def run_sharded(
             server_tp=server_tp,
         )
     else:
-        source = GatherSource(
-            checkpoint,
-            partial=ENGINE_CAPS[args.backend].partial_ownership,
-            batched=args.gather == "layer",
-        )
+        if declared:
+            source = DeclaredGatherSource(checkpoint, batched=args.gather == "layer")
+        else:
+            source = GatherSource(
+                checkpoint,
+                partial=ENGINE_CAPS[args.backend].partial_ownership,
+                batched=args.gather == "layer",
+            )
         if args.backend == "ipc":
             init_info = ipc_init_info(rank=rank)
         elif args.backend == "sharded_rdt":
@@ -288,6 +297,7 @@ def run_sharded(
             "layout": str(layout),
             "world_size": layout.world_size,
             "gather": args.gather,
+            "source_api": args.source_api,
             "load_seconds": load_seconds,
             "local_bytes_per_rank": local_bytes,
         },
@@ -329,6 +339,13 @@ def build_parser() -> argparse.ArgumentParser:
         default="layer",
         help="gather sharded weights one collective per layer, like FSDP2 "
         "(default), or one full_tensor() per tensor",
+    )
+    parser.add_argument(
+        "--source-api",
+        choices=("legacy", "declared"),
+        default="legacy",
+        help="legacy: held_names() / __iter__ / M2NWeightSource; declared: "
+        "ParamMeta owners with iter_full() / iter_local() (vLLM #63215)",
     )
     parser.add_argument("--timeout", type=float, default=1800)
     parser.add_argument("--output", type=Path, required=True)

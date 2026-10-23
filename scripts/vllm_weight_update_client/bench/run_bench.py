@@ -225,7 +225,7 @@ def run_trainer(args: argparse.Namespace, base_url: str) -> dict[str, Any]:
         cmd += ["--checkpoint", checkpoint]
     if args.placement_rules:
         cmd += ["--placement-rules", str(args.placement_rules)]
-    cmd += ["--gather", args.gather]
+    cmd += ["--gather", args.gather, "--source-api", args.source_api]
     if args.audit:
         cmd.append("--server-memory")
     env = dict(os.environ, **_extra_env(args), CUDA_VISIBLE_DEVICES=args.trainer_gpus)
@@ -286,6 +286,12 @@ def main() -> None:
         choices=("layer", "tensor"),
         default="layer",
         help="trainer gather granularity (see trainer_main.py --gather)",
+    )
+    parser.add_argument(
+        "--source-api",
+        choices=("legacy", "declared"),
+        default="legacy",
+        help="WeightSource flavor (see trainer_main.py --source-api)",
     )
     parser.add_argument(
         "--env",

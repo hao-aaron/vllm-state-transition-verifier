@@ -21,9 +21,16 @@ from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import DTensor, Placement, Replicate, Shard
 from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 from vllm.distributed.weight_transfer import ParamMeta, WeightSource
+
+try:  # the declared sources need vLLM with ParamMeta ownership (#63215)
+    from vllm.distributed.weight_transfer import Replicate as VReplicate
+    from vllm.distributed.weight_transfer import Shard as VShard
+except ImportError:
+    VReplicate = VShard = None
 from vllm.distributed.weight_transfer.base import _stack_key, layerwise_groups
 from vllm.distributed.weight_transfer.m2n_common import (
     REPLICATE,
+    M2NLayout,
     M2NMesh,
     M2NParamMeta,
 )
@@ -88,6 +95,10 @@ class ShardedCheckpoint:
         expert_mesh: DeviceMesh | None = None,
     ) -> None:
         self.manifest = manifest
+        self.layout = layout
+        self.rules = rules
+        self.mesh = mesh
+        self.expert_mesh = expert_mesh
         stage = layout.pp_rank(dist.get_rank())
         stage_mesh = mesh["dp", "fsdp", "tp"]
         names = [t.name for t in manifest.tensors]
@@ -331,7 +342,7 @@ class ShardedM2NSource(M2NWeightSource):
                     t.name,
                     _SAFETENSORS_DTYPE_TO_TORCH[t.safetensors_dtype][0],
                     tuple(t.shape),
-                    placements,
+                    M2NLayout(self._mesh, placements),
                 )
             )
 
@@ -344,3 +355,103 @@ class ShardedM2NSource(M2NWeightSource):
     def __iter__(self) -> Iterator[tuple[str, torch.Tensor]]:
         for meta in self._metadata:
             yield meta.name, self.checkpoint.tensors[meta.name].to_local()
+
+
+def _vllm_placements(spec: tuple[str, ...]) -> tuple:
+    return tuple(VReplicate() if s == "R" else VShard(int(s[1:])) for s in spec)
+
+
+def declared_metadata(checkpoint: ShardedCheckpoint) -> list[ParamMeta]:
+    """Every tensor's owners and layout, identical on every rank: the ranks of
+    its stage mesh (or its ep group's expert mesh), in mesh order, with the
+    placements it is sharded by. Ordered by ``layerwise_groups``, so each
+    gather group is contiguous."""
+    layout, rules = checkpoint.layout, checkpoint.rules
+    names = [t.name for t in checkpoint.manifest.tensors]
+    stage_of = pp_stages(names, layout.pp)
+    group_of = (
+        ep_groups(names, layout.ep) if checkpoint.expert_mesh is not None else {}
+    )
+    grid = checkpoint.mesh.mesh
+    metadata = {}
+    for t in checkpoint.manifest.tensors:
+        spec = rules.placement_spec(t.name, len(t.shape))
+        stage = stage_of[t.name]
+        if t.name in group_of:
+            assert checkpoint.expert_mesh is not None
+            ranks = checkpoint.expert_mesh.mesh[stage, group_of[t.name]]
+            spec = spec[1:]
+        else:
+            ranks = grid[stage]
+        metadata[t.name] = ParamMeta(
+            t.name,
+            _SAFETENSORS_DTYPE_TO_TORCH[t.safetensors_dtype][0],
+            tuple(t.shape),
+            owners=tuple(ranks.flatten().tolist()),
+            mesh_shape=tuple(ranks.shape),
+            placements=_vllm_placements(spec),
+        )
+    return [metadata[n] for g in layerwise_groups(list(metadata)) for n in g]
+
+
+class DeclaredGatherSource(WeightSource):
+    """Full tensors via ``iter_full``, one batch per layer, with ownership
+    declared in metadata instead of ``held_names()``.
+
+    A rank yields only the names it owns; each layer is gathered among its
+    owners, as ``gather_full`` does for an FSDP2 module.
+    """
+
+    def __init__(self, checkpoint: ShardedCheckpoint, batched: bool = True) -> None:
+        self.checkpoint = checkpoint
+        self.batched = batched
+        self._metadata = declared_metadata(checkpoint)
+
+    def metadata(self) -> list[ParamMeta]:
+        return self._metadata
+
+    def iter_full(self) -> Iterator[list[tuple[str, torch.Tensor]]]:
+        held = self.checkpoint.tensors
+        names = [m.name for m in self._metadata if m.name in held]
+        for _, layer in itertools.groupby(names, key=_stack_key):
+            layer = list(layer)
+            if self.batched:
+                full = gather_full([held[n] for n in layer])
+            else:
+                full = [held[n].full_tensor() for n in layer]
+            yield list(zip(layer, full))
+
+
+class DeclaredM2NSource(WeightSource):
+    """Local shards via ``iter_local``, with each tensor's mesh and placements
+    on the base ``ParamMeta``. Size-1 mesh axes are dropped, as m2n meshes
+    have at most two."""
+
+    def __init__(self, checkpoint: ShardedCheckpoint) -> None:
+        self.checkpoint = checkpoint
+        layout = checkpoint.layout
+        sizes = (layout.dp, layout.fsdp, layout.tp)
+        axes = [i for i, size in enumerate(sizes) if size > 1] or [0]
+        owners = tuple(range(layout.world_size))
+        self._metadata = []
+        for t in checkpoint.manifest.tensors:
+            spec = checkpoint.rules.placement_spec(t.name, len(t.shape))
+            self._metadata.append(
+                ParamMeta(
+                    t.name,
+                    _SAFETENSORS_DTYPE_TO_TORCH[t.safetensors_dtype][0],
+                    tuple(t.shape),
+                    owners=owners,
+                    mesh_shape=tuple(sizes[i] for i in axes),
+                    placements=_vllm_placements(tuple(spec[i] for i in axes)),
+                )
+            )
+
+    def metadata(self) -> list[ParamMeta]:
+        return self._metadata
+
+    def iter_local(self) -> Iterator[list[tuple[str, torch.Tensor]]]:
+        tensors = self.checkpoint.tensors
+        names = [m.name for m in self._metadata]
+        for _, layer in itertools.groupby(names, key=_stack_key):
+            yield [(n, tensors[n].to_local()) for n in layer]
