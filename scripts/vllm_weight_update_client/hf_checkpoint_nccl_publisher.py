@@ -194,7 +194,6 @@ class SafetensorsCheckpointSource(WeightSource):
         self.device = device
 
     @source_metadata
-
     def metadata(self) -> list[ParamMeta]:
         return [
             ParamMeta(

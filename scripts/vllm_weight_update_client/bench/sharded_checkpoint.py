@@ -279,7 +279,6 @@ class GatherSource(WeightSource):
             self._metadata = list(metadata.values())
 
     @source_metadata
-
     def metadata(self) -> list[ParamMeta]:
         return self._metadata
 
@@ -357,7 +356,6 @@ class ShardedM2NSource(M2NWeightSource):
         return self._mesh
 
     @source_metadata
-
     def metadata(self) -> list[ParamMeta]:
         return self._metadata
 
@@ -417,7 +415,6 @@ class DeclaredGatherSource(WeightSource):
         self._metadata = declared_metadata(checkpoint)
 
     @source_metadata
-
     def metadata(self) -> list[ParamMeta]:
         return self._metadata
 
@@ -459,7 +456,6 @@ class DeclaredM2NSource(WeightSource):
             )
 
     @source_metadata
-
     def metadata(self) -> list[ParamMeta]:
         return self._metadata
 
