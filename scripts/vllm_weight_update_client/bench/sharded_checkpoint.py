@@ -399,8 +399,8 @@ def declared_metadata(checkpoint: ShardedCheckpoint) -> list[ParamMeta]:
 
 
 class DeclaredGatherSource(WeightSource):
-    """Full tensors via ``iter_full``, one batch per layer, with ownership
-    declared in metadata instead of ``held_names()``.
+    """Full tensors via ``iter_full``, gathered a layer at a time, with
+    ownership declared in metadata instead of ``held_names()``.
 
     A rank yields only the names it owns; each layer is gathered among its
     owners, as ``gather_full`` does for an FSDP2 module.
@@ -414,7 +414,7 @@ class DeclaredGatherSource(WeightSource):
     def metadata(self) -> list[ParamMeta]:
         return self._metadata
 
-    def iter_full(self) -> Iterator[list[tuple[str, torch.Tensor]]]:
+    def iter_full(self) -> Iterator[tuple[str, torch.Tensor]]:
         held = self.checkpoint.tensors
         names = [m.name for m in self._metadata if m.name in held]
         for _, layer in itertools.groupby(names, key=_stack_key):
@@ -423,7 +423,7 @@ class DeclaredGatherSource(WeightSource):
                 full = gather_full([held[n] for n in layer])
             else:
                 full = [held[n].full_tensor() for n in layer]
-            yield list(zip(layer, full))
+            yield from zip(layer, full)
 
 
 class DeclaredM2NSource(WeightSource):
@@ -454,8 +454,6 @@ class DeclaredM2NSource(WeightSource):
     def metadata(self) -> list[ParamMeta]:
         return self._metadata
 
-    def iter_local(self) -> Iterator[list[tuple[str, torch.Tensor]]]:
-        tensors = self.checkpoint.tensors
-        names = [m.name for m in self._metadata]
-        for _, layer in itertools.groupby(names, key=_stack_key):
-            yield [(n, tensors[n].to_local()) for n in layer]
+    def iter_local(self) -> Iterator[tuple[str, torch.Tensor]]:
+        for m in self._metadata:
+            yield m.name, self.checkpoint.tensors[m.name].to_local()
