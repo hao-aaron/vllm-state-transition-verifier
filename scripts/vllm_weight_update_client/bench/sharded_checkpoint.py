@@ -34,7 +34,11 @@ from vllm.distributed.weight_transfer.m2n_common import (
     M2NMesh,
     M2NParamMeta,
 )
-from vllm.distributed.weight_transfer.m2n_source import M2NWeightSource
+
+try:  # legacy M2N source API, removed by vLLM #63215
+    from vllm.distributed.weight_transfer.m2n_source import M2NWeightSource
+except ImportError:
+    M2NWeightSource = WeightSource
 
 from hf_checkpoint_nccl_publisher import (
     _SAFETENSORS_DTYPE_TO_TORCH,
