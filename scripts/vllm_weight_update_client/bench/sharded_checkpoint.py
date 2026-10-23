@@ -43,6 +43,7 @@ except ImportError:
 from hf_checkpoint_nccl_publisher import (
     _SAFETENSORS_DTYPE_TO_TORCH,
     CheckpointManifest,
+    source_metadata,
 )
 
 
@@ -277,6 +278,8 @@ class GatherSource(WeightSource):
                 raise ValueError("a full-ownership source must hold every tensor")
             self._metadata = list(metadata.values())
 
+    @source_metadata
+
     def metadata(self) -> list[ParamMeta]:
         return self._metadata
 
@@ -353,6 +356,8 @@ class ShardedM2NSource(M2NWeightSource):
     def mesh(self) -> M2NMesh:
         return self._mesh
 
+    @source_metadata
+
     def metadata(self) -> list[ParamMeta]:
         return self._metadata
 
@@ -411,6 +416,8 @@ class DeclaredGatherSource(WeightSource):
         self.batched = batched
         self._metadata = declared_metadata(checkpoint)
 
+    @source_metadata
+
     def metadata(self) -> list[ParamMeta]:
         return self._metadata
 
@@ -450,6 +457,8 @@ class DeclaredM2NSource(WeightSource):
                     placements=_vllm_placements(tuple(spec[i] for i in axes)),
                 )
             )
+
+    @source_metadata
 
     def metadata(self) -> list[ParamMeta]:
         return self._metadata

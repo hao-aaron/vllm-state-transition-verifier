@@ -14,6 +14,7 @@ import mmap
 import os
 import re
 import struct
+import functools
 import time
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -40,6 +41,18 @@ from vllm.distributed.weight_transfer.packed_tensor import (
     packed_nccl_broadcast_producer,
 )
 from vllm.utils.network_utils import get_ip, get_open_port
+
+# vLLM #63215 turns WeightSource.metadata into a cached_property; upstream main
+# still has a method. These keep the bench's sources working against both.
+_METADATA_IS_PROPERTY = isinstance(WeightSource.__dict__["metadata"], property)
+
+
+def source_metadata(fn):
+    return functools.cached_property(fn) if _METADATA_IS_PROPERTY else fn
+
+
+def read_metadata(source: WeightSource) -> list[ParamMeta]:
+    return source.metadata if _METADATA_IS_PROPERTY else source.metadata()
 
 _SAFETENSORS_DTYPE_TO_TORCH = {
     "BOOL": (torch.bool, 1),
@@ -179,6 +192,8 @@ class SafetensorsCheckpointSource(WeightSource):
     def __init__(self, manifest: CheckpointManifest, device: torch.device) -> None:
         self.manifest = manifest
         self.device = device
+
+    @source_metadata
 
     def metadata(self) -> list[ParamMeta]:
         return [
@@ -597,7 +612,7 @@ class NcclCheckpointPublisher:
         transfer_started = time.perf_counter()
 
         metadata_started = time.perf_counter()
-        source_metadata = source.metadata()
+        source_metadata = read_metadata(source)
         metadata_seconds = time.perf_counter() - metadata_started
         expected_names = [item.name for item in source_metadata]
         duplicate_names = _duplicate_names(expected_names)
