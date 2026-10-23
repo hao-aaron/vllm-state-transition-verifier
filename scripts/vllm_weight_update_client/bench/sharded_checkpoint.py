@@ -423,11 +423,24 @@ class DeclaredGatherSource(WeightSource):
         names = [m.name for m in self._metadata if m.name in held]
         for _, layer in itertools.groupby(names, key=_stack_key):
             layer = list(layer)
-            if self.batched:
-                full = gather_full([held[n] for n in layer])
-            else:
-                full = [held[n].full_tensor() for n in layer]
-            yield from zip(layer, full)
+            if not self.batched:
+                for n in layer:
+                    yield n, held[n].full_tensor()
+                continue
+            full = gather_full([held[n] for n in layer])
+            ready = None
+            if full and full[0].is_cuda:
+                ready = torch.cuda.Event()
+                ready.record()
+            for name, tensor in zip(layer, full):
+                # the layer was gathered on the stream current at its first
+                # next(); a consumer may resume us on another (the packed nccl
+                # sender switches streams per chunk)
+                if ready is not None:
+                    stream = torch.cuda.current_stream()
+                    stream.wait_event(ready)
+                    tensor.record_stream(stream)
+                yield name, tensor
 
 
 class DeclaredM2NSource(WeightSource):
