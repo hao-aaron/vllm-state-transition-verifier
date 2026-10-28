@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import itertools
 from collections.abc import Iterator
+from functools import cached_property
 from pathlib import Path
 
 import torch
@@ -21,13 +22,9 @@ from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import DTensor, Placement, Replicate, Shard
 from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 from vllm.distributed.weight_transfer import ParamMeta, WeightSource
+from vllm.distributed.weight_transfer import Replicate as SourceReplicate
+from vllm.distributed.weight_transfer import Shard as SourceShard
 from vllm.distributed.weight_transfer.base import _stack_key, layerwise_groups
-from vllm.distributed.weight_transfer.m2n_common import (
-    REPLICATE,
-    M2NMesh,
-    M2NParamMeta,
-)
-from vllm.distributed.weight_transfer.m2n_source import M2NWeightSource
 
 from hf_checkpoint_nccl_publisher import (
     _SAFETENSORS_DTYPE_TO_TORCH,
@@ -73,7 +70,8 @@ class ShardedCheckpoint:
     """This rank's share of a checkpoint under ``layout``.
 
     Tensors of other pipeline stages, and with ep the experts of other ep
-    groups, are not held. ``load`` refills the local
+    groups, are not held; ``owners`` maps every tensor to the global ranks
+    that hold it, the same on every rank. ``load`` refills the local
     shards in place from another checkpoint with the same schema, the way a
     training step changes the weights without moving them.
     """
@@ -88,7 +86,8 @@ class ShardedCheckpoint:
         expert_mesh: DeviceMesh | None = None,
     ) -> None:
         self.manifest = manifest
-        stage = layout.pp_rank(dist.get_rank())
+        self.rank = dist.get_rank()
+        stage = layout.pp_rank(self.rank)
         stage_mesh = mesh["dp", "fsdp", "tp"]
         names = [t.name for t in manifest.tensors]
         stage_of = pp_stages(names, layout.pp)
@@ -96,6 +95,13 @@ class ShardedCheckpoint:
         if expert_mesh is not None:
             ep_group = expert_mesh.get_coordinate()[1]
             group_mesh = expert_mesh["edp", "tp"]
+        self.owners: dict[str, tuple[int, ...]] = {}
+        for name in names:
+            if name in group_of:
+                ranks = expert_mesh.mesh[stage_of[name], group_of[name]]
+            else:
+                ranks = mesh.mesh[stage_of[name]]
+            self.owners[name] = tuple(ranks.flatten().tolist())
         self.tensors: dict[str, DTensor] = {}
         self._slices: dict[str, tuple[slice, ...]] = {}
         for meta in manifest.tensors:
@@ -232,8 +238,8 @@ class GatherSource(WeightSource):
     Without ``partial`` every rank holds every tensor and iterates in manifest
     order. With ``partial`` (engines with partial ownership, e.g. a pp stage
     holding its layers), metadata is the manifest in ``layerwise_groups``
-    order, so each gather group is contiguous; a rank iterates only the groups
-    it holds part of, yielding ``None`` for names held elsewhere.
+    order, so each gather group is contiguous, and declares each tensor's
+    owners; a rank iterates only the names it owns.
 
     ``batched`` gathers each layer with ``gather_full``, as an FSDP2 trainer
     unshards a module; without it each tensor is gathered by its own
@@ -246,65 +252,57 @@ class GatherSource(WeightSource):
         self.checkpoint = checkpoint
         self.partial = partial
         self.batched = batched
+        if not partial and len(checkpoint.tensors) != len(
+            checkpoint.manifest.tensors
+        ):
+            raise ValueError("a full-ownership source must hold every tensor")
+
+    @cached_property
+    def metadata(self) -> list[ParamMeta]:
         metadata = {
             t.name: ParamMeta(
                 t.name,
                 _SAFETENSORS_DTYPE_TO_TORCH[t.safetensors_dtype][0],
                 tuple(t.shape),
+                owners=self.checkpoint.owners[t.name] if self.partial else None,
             )
-            for t in checkpoint.manifest.tensors
+            for t in self.checkpoint.manifest.tensors
         }
-        if partial:
-            groups = layerwise_groups(list(metadata))
-            self._metadata = [metadata[name] for g in groups for name in g]
-        else:
-            if len(checkpoint.tensors) != len(metadata):
-                raise ValueError("a full-ownership source must hold every tensor")
-            self._metadata = list(metadata.values())
+        if not self.partial:
+            return list(metadata.values())
+        groups = layerwise_groups(list(metadata))
+        return [metadata[name] for g in groups for name in g]
 
-    def metadata(self) -> list[ParamMeta]:
-        return self._metadata
-
-    def held_names(self) -> set[str] | None:
-        return set(self.checkpoint.tensors) if self.partial else None
-
-    def __iter__(self) -> Iterator[tuple[str, torch.Tensor | None]]:
-        names = (
-            [name for g in self.groups() for name in g]
-            if self.partial
-            else [m.name for m in self._metadata]
-        )
+    def iter_full(self) -> Iterator[tuple[str, torch.Tensor]]:
+        names = self.owned_names(self.checkpoint.rank)
         if not self.batched:
             for name in names:
-                tensor = self.checkpoint.tensors.get(name)
-                yield name, None if tensor is None else tensor.full_tensor()
+                yield name, self.checkpoint.tensors[name].full_tensor()
             return
         for _, layer in itertools.groupby(names, key=_stack_key):
             layer = list(layer)
-            held = [n for n in layer if n in self.checkpoint.tensors]
-            full = gather_full([self.checkpoint.tensors[n] for n in held])
-            gathered = dict(zip(held, full))
+            full = gather_full([self.checkpoint.tensors[n] for n in layer])
             ready = None
-            if full and full[0].is_cuda:
+            if full[0].is_cuda:
                 ready = torch.cuda.Event()
                 ready.record()
-            for name in layer:
-                tensor = gathered.pop(name, None)
+            for name, tensor in zip(layer, full):
                 # the layer was gathered on the stream current at its first
                 # next(); a consumer may resume us on another (the packed nccl
                 # sender switches streams per chunk)
-                if tensor is not None and ready is not None:
+                if ready is not None:
                     stream = torch.cuda.current_stream()
                     stream.wait_event(ready)
                     tensor.record_stream(stream)
                 yield name, tensor
 
 
-class ShardedM2NSource(M2NWeightSource):
+class ShardedM2NSource(WeightSource):
     """Local shards and their placements, for nccl_m2n (no gather).
 
-    m2n meshes have two axes, so the stage mesh's size-1 dimensions are dropped;
-    ``engines.unsupported_reasons`` has already refused layouts that need more.
+    m2n meshes have at most two axes, so the stage mesh's size-1 dimensions are
+    dropped; ``engines.unsupported_reasons`` has already refused layouts that
+    need more.
     """
 
     def __init__(
@@ -314,33 +312,36 @@ class ShardedM2NSource(M2NWeightSource):
         rules: PlacementRules,
     ) -> None:
         self.checkpoint = checkpoint
-        sizes = (layout.dp, layout.fsdp, layout.tp)
-        axes = [i for i, size in enumerate(sizes) if size > 1]
+        self.layout = layout
+        self.rules = rules
+
+    @cached_property
+    def metadata(self) -> list[ParamMeta]:
+        sizes = (self.layout.dp, self.layout.fsdp, self.layout.tp)
+        axes = [i for i, size in enumerate(sizes) if size > 1] or [0]
         if len(axes) > 2:
-            raise ValueError(f"nccl_m2n cannot describe layout {layout}")
-        dims = [sizes[i] for i in axes] + [1] * (2 - len(axes))
-        self._mesh = M2NMesh((dims[0], dims[1]), 0)
-        self._metadata = []
-        for t in checkpoint.manifest.tensors:
-            spec = rules.placement_spec(t.name, len(t.shape))
-            codes = [REPLICATE if spec[i] == "R" else int(spec[i][1:]) for i in axes]
-            codes += [REPLICATE] * (2 - len(codes))
-            placements = None if codes == [REPLICATE, REPLICATE] else tuple(codes)
-            self._metadata.append(
-                M2NParamMeta(
+            raise ValueError(f"nccl_m2n cannot describe layout {self.layout}")
+        owners = tuple(range(self.layout.world_size))
+        metadata = []
+        for t in self.checkpoint.manifest.tensors:
+            spec = self.rules.placement_spec(t.name, len(t.shape))
+            metadata.append(
+                ParamMeta(
                     t.name,
                     _SAFETENSORS_DTYPE_TO_TORCH[t.safetensors_dtype][0],
                     tuple(t.shape),
-                    placements,
+                    owners=owners,
+                    mesh_shape=tuple(sizes[i] for i in axes),
+                    placements=tuple(
+                        SourceReplicate()
+                        if spec[i] == "R"
+                        else SourceShard(int(spec[i][1:]))
+                        for i in axes
+                    ),
                 )
             )
+        return metadata
 
-    def mesh(self) -> M2NMesh:
-        return self._mesh
-
-    def metadata(self) -> list[ParamMeta]:
-        return self._metadata
-
-    def __iter__(self) -> Iterator[tuple[str, torch.Tensor]]:
-        for meta in self._metadata:
+    def iter_local(self) -> Iterator[tuple[str, torch.Tensor]]:
+        for meta in self.metadata:
             yield meta.name, self.checkpoint.tensors[meta.name].to_local()

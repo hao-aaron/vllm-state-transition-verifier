@@ -19,6 +19,7 @@ from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass
+from functools import cached_property
 from pathlib import Path
 from typing import Any, Literal
 
@@ -180,6 +181,7 @@ class SafetensorsCheckpointSource(WeightSource):
         self.manifest = manifest
         self.device = device
 
+    @cached_property
     def metadata(self) -> list[ParamMeta]:
         return [
             ParamMeta(
@@ -190,7 +192,7 @@ class SafetensorsCheckpointSource(WeightSource):
             for tensor in self.manifest.tensors
         ]
 
-    def __iter__(self) -> Iterator[tuple[str, torch.Tensor]]:
+    def iter_full(self) -> Iterator[tuple[str, torch.Tensor]]:
         return self.manifest.iter_cuda_tensors(self.device)
 
 
@@ -597,7 +599,7 @@ class NcclCheckpointPublisher:
         transfer_started = time.perf_counter()
 
         metadata_started = time.perf_counter()
-        source_metadata = source.metadata()
+        source_metadata = source.metadata
         metadata_seconds = time.perf_counter() - metadata_started
         expected_names = [item.name for item in source_metadata]
         duplicate_names = _duplicate_names(expected_names)
@@ -621,7 +623,7 @@ class NcclCheckpointPublisher:
                 "non-experts first followed by complete expert-layer groups"
             )
         expected_total_bytes = sum(_param_nbytes(item) for item in source_metadata)
-        source_iter = iter(source)
+        source_iter = source.iter_full()
         bucket_results: list[dict[str, Any]] = []
         sent_names: list[str] = []
         sent_total_bytes = 0
